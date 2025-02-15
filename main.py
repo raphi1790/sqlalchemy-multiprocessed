@@ -1,72 +1,93 @@
+import polars as pl
 import pandas as pd
 import time
 import multiprocessing
 from sqlalchemy import create_engine
+import psycopg2
+
+
+def time_logger(func):
+    """Decorator to log the time taken by a function."""
+    def wrapper(*args, **kwargs):
+        start_time = time.time()
+        result = func(*args, **kwargs)
+        print(
+            f"Function '{func.__name__}' took {time.time() - start_time} seconds.")
+        return result
+    return wrapper
 
 
 def write_chunk_to_db(chunk, connection_string, table_name):
-    engine = create_engine(connection_string)
-    chunk.to_sql(table_name, engine, if_exists='append', index=False)
+    """Writes a DataFrame chunk to the database."""
+    try:
+        engine = create_engine(connection_string)
+        with engine.connect() as conn:
+            chunk.to_pandas().to_sql(table_name, conn, if_exists='append', index=False)
+    except Exception as e:
+        print(f"Error writing chunk: {e}")
 
 
+def create_table_if_not_exists(df, connection_string, table_name):
+    """Creates the table if it doesn't already exist."""
+    try:
+        engine = create_engine(connection_string)
+        with engine.connect() as conn:
+            df.head(0).to_pandas().to_sql(
+                table_name, conn, if_exists='replace', index=False)
+            print(f"Table '{table_name}' created successfully.")
+        engine.dispose()
+    except Exception as e:
+        print(f"Error creating table: {e}")
+        raise
+
+
+@time_logger
 def write_dataframe_with_multiprocessing(df, connection_string, table_name, num_processes=None):
     """Writes the entire DataFrame to the database using multiprocessing."""
-
     if num_processes is None:
-        num_processes = multiprocessing.cpu_count()
+        num_processes = multiprocessing.cpu_count() - 3
+        print(f"Using {num_processes} processes.")
 
     chunk_size = (len(df) // num_processes) + 1  # Calculate chunk size
 
-    processes = []
-    for i in range(num_processes):
-        start = i * chunk_size
-        end = min((i + 1) * chunk_size, len(df))
-        # Create a copy of the dataframe chunk
-        chunk_to_process = df.iloc[start:end].copy()
-        p = multiprocessing.Process(target=write_chunk_to_db, args=(
-            chunk_to_process, connection_string, table_name))
-        processes.append(p)
-        p.start()
+    with multiprocessing.Pool(processes=num_processes) as pool:
+        chunks = []
+        for i in range(num_processes):
+            start = i * chunk_size
+            end = min((i + 1) * chunk_size, len(df))
+            chunks.append(df[start:end].clone())
 
-    for p in processes:
-        p.join()
-
-    print(
-        f"Finished writing DataFrame to the database table '{table_name}' using multiprocessing.")
+        pool.starmap(write_chunk_to_db, [
+                     (chunk, connection_string, table_name) for chunk in chunks])
 
 
+@time_logger
+def read_dataframe_with_polars():
+    csv_file = "test_data.csv"
+    df = pl.read_csv(csv_file)
+    return df
+
+
+@time_logger
 def write_dataframe_single_process(df, connection_string, table_name):
     engine = create_engine(connection_string)
-    df.to_sql(table_name, engine, if_exists='replace', index=False)
+    df.to_pandas().to_sql(table_name, engine, if_exists='append', index=False)
     print(
         f"Finished writing DataFrame to the database table '{table_name}' using single processing.")
+    engine.dispose()
 
 
 if __name__ == "__main__":
-    csv_file = "test_data.csv"
     db_connection_string = "postgresql+psycopg2://raphscho:test@localhost:5432/testdb"
 
-    try:
-        # Read the entire CSV
-        df = pd.read_csv(csv_file)
+    df = read_dataframe_with_polars()
+    create_table_if_not_exists(
+        df, db_connection_string, "single_process_table")
+    write_dataframe_single_process(
+        df, db_connection_string, "single_process_table")
 
-        # Measure time for single processing
-        start_time = time.time()
-        write_dataframe_single_process(
-            df, db_connection_string, "single_process_table")
-        single_process_time = time.time() - start_time
-        print(f"Single processing time: {single_process_time} seconds")
-
-        # Measure time for multiprocessing
-        start_time = time.time()
-        write_dataframe_with_multiprocessing(
-            df, db_connection_string, "multiprocessed_table")
-        multi_process_time = time.time() - start_time
-        print(f"Multiprocessing time: {multi_process_time} seconds")
-
-    except FileNotFoundError:
-        print(f"Error: CSV file '{csv_file}' not found.")
-    except pd.errors.EmptyDataError:
-        print(f"Error: CSV file '{csv_file}' is empty.")
-    except Exception as e:
-        print(f"An error occurred: {e}")
+    # # Measure time for multiprocessing
+    # create_table_if_not_exists(
+    #     df, db_connection_string, "multiprocessed_table")
+    # write_dataframe_with_multiprocessing(
+    #     df, db_connection_string, "multiprocessed_table", 5)
